@@ -1,0 +1,20 @@
+# Secrets: never commit these
+.env
+.env.*
+!.env.example
+
+# Python and tools
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Personal Claude Code permissions (the skills in .claude/skills are shared)
+.claude/settings.local.json
+
+# A link that Streamlit made into .venv. It would be broken on GitHub.
+.agents/
+
+# Local caches
+.flashrank_cache/
+*.log
