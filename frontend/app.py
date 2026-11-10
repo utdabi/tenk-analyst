@@ -4,6 +4,7 @@ Start it with:  uv run python -m streamlit run frontend/app.py
 """
 import os
 import secrets
+import time
 import uuid
 
 import httpx
@@ -29,22 +30,31 @@ EXAMPLES = ["What risks does Tesla report about battery supply?",
             "Compare GM and Ford R&D in 2025",
             "How did Carvana's revenue change from 2024 to 2025?"]
 UNAVAILABLE = "The answer service is not available right now. Try again in a minute."
+WAKE_UP_SECONDS = 30  # how long to wait for a sleeping server before the second try
 
 
 # ---------- Talking to the back end ----------
 
 def ask_backend(payload: dict) -> dict:
-    """Send the question. If the server does not answer in 90 seconds (it may be asleep), wait and try once more."""
+    """Send the question. A sleeping server may not answer, or Render may answer with its own "waking up" page.
+    In both cases, wait and try once more."""
     for attempt in (1, 2):
+        waited_already = False
         try:
             response = httpx.post(f"{API_URL}/ask", json=payload, headers={"X-Access-Code": ACCESS_CODE},
                                   timeout=90)
-            return response.json()
-        except (httpx.TimeoutException, httpx.TransportError):
-            if attempt == 1:
-                st.info("The server is waking up. This takes about 30 seconds.")
-        except ValueError:  # the reply was not JSON
-            break
+            try:
+                return response.json()  # our back end always answers with JSON, also for its errors
+            except ValueError:
+                pass  # not JSON: this is Render's page for a server that is still starting
+        except httpx.TimeoutException:
+            waited_already = True  # we have just waited 90 seconds, so no need to wait more
+        except httpx.TransportError:
+            pass  # no connection: the server is not up yet
+        if attempt == 1:
+            st.info("The server is waking up. This takes about 30 seconds.")
+            if not waited_already:
+                time.sleep(WAKE_UP_SECONDS)
     return {"error": UNAVAILABLE}
 
 
