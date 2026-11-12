@@ -40,17 +40,14 @@ EXAMPLES = ["What risks does Tesla report about battery supply?",
             "Compare GM and Ford R&D in 2025",
             "How did Carvana's revenue change from 2024 to 2025?"]
 UNAVAILABLE = "The answer service is not available right now. Try again in a minute."
-WAKE_UP_LIMIT = 180  # seconds to wait for a sleeping server (a cold start on Render can take 1 to 3 minutes)
-WAKE_FAILED = "The server did not wake up in 3 minutes. Please try again in a few minutes."
+# Seconds to wait for a sleeping server (a cold start on Render can take 1 to 3 minutes). A test can set it lower.
+WAKE_UP_LIMIT = int(os.environ.get("WAKE_UP_LIMIT", "180"))
 
 
 # ---------- Talking to the back end ----------
 
-problem = {"last": "none"}  # why the last call failed; shown to the user if the server never wakes up
-
-
 def note_problem(text: str) -> None:
-    problem["last"] = text
+    """Write why a call failed to the Render log. The user does not see it."""
     log.warning("%s", text)
 
 
@@ -105,7 +102,7 @@ def ask_backend(payload: dict) -> dict:
         time.sleep(3)
     waiting.empty()
     log.error("Gave up after %d s", WAKE_UP_LIMIT)
-    return {"error": f"{WAKE_FAILED} (Tried {API_URL}. Last problem: {problem['last']}.)"}
+    return {"error": "The server did not start.", "wake_failed": True}  # show_message adds the link and the button
 
 
 # ---------- Showing a message ----------
@@ -121,8 +118,21 @@ def show_source(source: dict) -> None:
         st.caption(source["excerpt"])
 
 
-def show_message(message: dict, show_sources: bool) -> None:
+def retry_last() -> None:
+    """The "Try again" button: take the question back and ask it again, so the user does not retype it."""
+    question = st.session_state.messages[-2]["content"]
+    del st.session_state.messages[-2:]  # the question and the failed reply; the question is added again when asked
+    st.session_state.pending = question
+
+
+def show_message(message: dict, show_sources: bool, can_retry: bool = False) -> None:
     with st.chat_message(message["role"]):
+        if message.get("wake_failed"):  # the back end is asleep: tell the user how to wake it
+            st.warning(f"The server did not start. Click [{API_URL}]({API_URL}) to wake it up, "
+                       "then come back and press **Try again**.")
+            if can_retry:
+                st.button("Try again", key=f"retry_{len(st.session_state.messages)}", on_click=retry_last)
+            return
         if message.get("failed"):
             st.error(message["content"])
             return
@@ -182,8 +192,8 @@ sidebar_years = [] if len(years) in (0, len(YEARS)) else years
 st.title("10-K Analyst")
 st.caption("Ask about the 10-K filings of ten US auto companies, fiscal years 2024 and 2025.")
 
-for message in st.session_state.messages:
-    show_message(message, show_sources)
+for number, message in enumerate(st.session_state.messages):
+    show_message(message, show_sources, can_retry=number == len(st.session_state.messages) - 1)  # only the last one
 
 question = st.chat_input("Ask a question") or st.session_state.pop("pending", None)
 if not st.session_state.messages and not question:
@@ -204,6 +214,7 @@ if question:
         assistant_message = {"role": "assistant", "content": reply["answer"], "tools_used": reply["tools_used"],
                              "sources": reply["sources"]}
     else:  # the back end sent an error text (or FastAPI sent its own 422 reply)
-        assistant_message = {"role": "assistant", "content": reply.get("error", UNAVAILABLE), "failed": True}
+        assistant_message = {"role": "assistant", "content": reply.get("error", UNAVAILABLE), "failed": True,
+                             "wake_failed": reply.get("wake_failed", False)}
     st.session_state.messages.append(assistant_message)
-    show_message(assistant_message, show_sources)
+    show_message(assistant_message, show_sources, can_retry=True)
