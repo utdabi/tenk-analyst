@@ -30,32 +30,45 @@ EXAMPLES = ["What risks does Tesla report about battery supply?",
             "Compare GM and Ford R&D in 2025",
             "How did Carvana's revenue change from 2024 to 2025?"]
 UNAVAILABLE = "The answer service is not available right now. Try again in a minute."
-WAKE_UP_SECONDS = 30  # how long to wait for a sleeping server before the second try
+WAKE_UP_LIMIT = 180  # seconds to wait for a sleeping server (a cold start on Render can take 1 to 3 minutes)
+WAKE_FAILED = "The server did not wake up in 3 minutes. Please try again in a few minutes."
 
 
 # ---------- Talking to the back end ----------
 
+def post_question(payload: dict) -> dict | None:
+    """Send the question once. Return the JSON reply, or None when the server did not really answer."""
+    try:
+        response = httpx.post(f"{API_URL}/ask", json=payload, headers={"X-Access-Code": ACCESS_CODE}, timeout=90)
+        return response.json()  # our back end always answers with JSON, also for its errors
+    except (httpx.TransportError, ValueError):
+        return None  # no connection, a timeout, or Render's own "waking up" page (not JSON)
+
+
+def backend_is_up() -> bool:
+    """GET /health is free. Check for our JSON, because Render's waking-up page can also have status 200."""
+    try:
+        return httpx.get(f"{API_URL}/health", timeout=10).json().get("status") == "ok"
+    except (httpx.TransportError, ValueError):
+        return False
+
+
 def ask_backend(payload: dict) -> dict:
-    """Send the question. A sleeping server may not answer, or Render may answer with its own "waking up" page.
-    In both cases, wait and try once more."""
-    for attempt in (1, 2):
-        waited_already = False
-        try:
-            response = httpx.post(f"{API_URL}/ask", json=payload, headers={"X-Access-Code": ACCESS_CODE},
-                                  timeout=90)
-            try:
-                return response.json()  # our back end always answers with JSON, also for its errors
-            except ValueError:
-                pass  # not JSON: this is Render's page for a server that is still starting
-        except httpx.TimeoutException:
-            waited_already = True  # we have just waited 90 seconds, so no need to wait more
-        except httpx.TransportError:
-            pass  # no connection: the server is not up yet
-        if attempt == 1:
-            st.info("The server is waking up. This takes about 30 seconds.")
-            if not waited_already:
-                time.sleep(WAKE_UP_SECONDS)
-    return {"error": UNAVAILABLE}
+    """Send the question. If the server does not answer, it is probably asleep: ask /health every 3 seconds
+    (showing the seconds on the page) until it is up, then send the question again."""
+    reply = post_question(payload)
+    if reply is not None:
+        return reply
+    waiting = st.empty()
+    started = time.time()
+    while time.time() - started < WAKE_UP_LIMIT:
+        if backend_is_up():
+            waiting.empty()
+            return post_question(payload) or {"error": UNAVAILABLE}
+        waiting.info(f"The server is waking up... {int(time.time() - started)} s (this can take up to 3 minutes)")
+        time.sleep(3)
+    waiting.empty()
+    return {"error": WAKE_FAILED}
 
 
 # ---------- Showing a message ----------
