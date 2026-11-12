@@ -2,6 +2,7 @@
 
 Start it with:  uv run python -m streamlit run frontend/app.py
 """
+import logging
 import os
 import secrets
 import time
@@ -14,6 +15,15 @@ from dotenv import load_dotenv
 load_dotenv()
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
 ACCESS_CODE = os.environ.get("ACCESS_CODE", "")
+
+# These lines appear in the Render logs of the front end. They never contain the access code or the question.
+log = logging.getLogger("tenk-ui")
+if not log.handlers:  # Streamlit runs this file again on every click; add the handler only once
+    log.addHandler(logging.StreamHandler())
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    # repr() shows a hidden space or line break at the end of the pasted value
+    log.info("Front end started. API_URL=%r, ACCESS_CODE set=%s", API_URL, bool(ACCESS_CODE))
 
 # The front end does not import the back-end code (they are two separate services), so the names are repeated here.
 COMPANIES = {"TSLA": "Tesla", "GM": "General Motors", "F": "Ford", "RIVN": "Rivian", "LCID": "Lucid",
@@ -36,39 +46,66 @@ WAKE_FAILED = "The server did not wake up in 3 minutes. Please try again in a fe
 
 # ---------- Talking to the back end ----------
 
+problem = {"last": "none"}  # why the last call failed; shown to the user if the server never wakes up
+
+
+def note_problem(text: str) -> None:
+    problem["last"] = text
+    log.warning("%s", text)
+
+
 def post_question(payload: dict) -> dict | None:
     """Send the question once. Return the JSON reply, or None when the server did not really answer."""
     try:
         response = httpx.post(f"{API_URL}/ask", json=payload, headers={"X-Access-Code": ACCESS_CODE}, timeout=90)
+    except httpx.TransportError as error:  # no connection, or a timeout
+        note_problem(f"POST /ask failed: {type(error).__name__}")
+        return None
+    try:
         return response.json()  # our back end always answers with JSON, also for its errors
-    except (httpx.TransportError, ValueError):
-        return None  # no connection, a timeout, or Render's own "waking up" page (not JSON)
+    except ValueError:  # Render's own "waking up" page is not JSON
+        note_problem(f"POST /ask got a page that is not JSON (status {response.status_code})")
+        return None
 
 
 def backend_is_up() -> bool:
     """GET /health is free. Check for our JSON, because Render's waking-up page can also have status 200."""
     try:
-        return httpx.get(f"{API_URL}/health", timeout=10).json().get("status") == "ok"
-    except (httpx.TransportError, ValueError):
+        response = httpx.get(f"{API_URL}/health", timeout=10)
+    except httpx.TransportError as error:
+        note_problem(f"GET /health failed: {type(error).__name__}")
         return False
+    try:
+        if response.json().get("status") == "ok":
+            return True
+    except ValueError:
+        pass
+    note_problem(f"GET /health did not return our JSON (status {response.status_code})")
+    return False
 
 
 def ask_backend(payload: dict) -> dict:
     """Send the question. If the server does not answer, it is probably asleep: ask /health every 3 seconds
     (showing the seconds on the page) until it is up, then send the question again."""
+    started = time.time()
+    log.info("Sending the question (pipeline=%s, length=%d)", payload["pipeline"], len(payload["question"]))
     reply = post_question(payload)
     if reply is not None:
+        log.info("Got a reply after %.1f s", time.time() - started)
         return reply
+    log.info("No real reply after %.1f s. Waiting for /health", time.time() - started)
     waiting = st.empty()
     started = time.time()
     while time.time() - started < WAKE_UP_LIMIT:
         if backend_is_up():
+            log.info("/health is ok after %d s. Sending the question again", time.time() - started)
             waiting.empty()
             return post_question(payload) or {"error": UNAVAILABLE}
         waiting.info(f"The server is waking up... {int(time.time() - started)} s (this can take up to 3 minutes)")
         time.sleep(3)
     waiting.empty()
-    return {"error": WAKE_FAILED}
+    log.error("Gave up after %d s", WAKE_UP_LIMIT)
+    return {"error": f"{WAKE_FAILED} (Tried {API_URL}. Last problem: {problem['last']}.)"}
 
 
 # ---------- Showing a message ----------

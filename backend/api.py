@@ -5,6 +5,7 @@ Start it with:  uv run python -m uvicorn backend.api:app
 import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header
@@ -13,6 +14,8 @@ from pydantic import BaseModel, Field
 
 from backend import agent, pipelines
 
+# Without this, Python shows only warnings and errors, so our info lines would not appear in the Render logs.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # keep the server log short; it logs every request otherwise
 log = logging.getLogger("tenk")
 
@@ -38,8 +41,12 @@ def check_environment() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    started = time.time()
+    log.info("Starting: checking the environment variables")
     check_environment()
+    log.info("Starting: opening the Neon connections")
     agent.get_checkpointer()  # opens the Neon connections now, so a problem shows at start-up
+    log.info("Ready after %.1f s", time.time() - started)  # this is the cold-start time of the back end
     yield
     agent.close_memory()
 
@@ -70,6 +77,7 @@ def ask(request: AskRequest, x_access_code: str | None = Header(default=None)):
     # The checks run in the order of the error table.
     expected = os.environ.get("ACCESS_CODE", "")
     if not expected or not x_access_code or not secrets.compare_digest(x_access_code, expected):
+        log.warning("/ask refused: wrong or missing access code")  # never log the codes themselves
         return error(401, "Wrong or missing access code.")
     if not request.question.strip():
         return error(400, "The question is empty.")
@@ -78,10 +86,15 @@ def ask(request: AskRequest, x_access_code: str | None = Header(default=None)):
     if request.pipeline not in PIPELINES:
         return error(400, "Unknown pipeline. Use simple, filters, rerank, decompose, or agent.")
 
+    started = time.time()
+    # Log the pipeline and the length, not the question: questions can contain personal data.
+    log.info("/ask received: pipeline=%s, question length=%d", request.pipeline, len(request.question))
     try:
-        return pipelines.answer(request.question, request.pipeline, request.companies, request.years,
-                                request.chat_id)
+        result = pipelines.answer(request.question, request.pipeline, request.companies, request.years,
+                                  request.chat_id)
+        log.info("/ask answered in %.1f s", time.time() - started)
+        return result
     except Exception as e:  # OpenRouter, Qdrant, Neon, or SEC failed
         # Log only the type of the error. Its message can contain a key. Never return a stack trace.
-        log.error("The answer failed: %s", type(e).__name__)
+        log.error("The answer failed after %.1f s: %s", time.time() - started, type(e).__name__)
         return error(503, UNAVAILABLE)
